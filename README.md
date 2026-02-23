@@ -1,6 +1,6 @@
 # ghostty-dir-themes (gdt)
 
-A curses TUI that manages per-directory color themes for the [Ghostty](https://ghostty.org) terminal. When you `cd` into a mapped directory, your terminal colors change automatically.
+Manage per-directory color themes for the [Ghostty](https://ghostty.org) terminal. When you `cd` into a mapped directory, your terminal colors change automatically.
 
 ## Requirements
 
@@ -34,13 +34,27 @@ Restart your shell or run `source ~/.zshrc`.
 
 ## Usage
 
-Launch the TUI:
+### Inline Picker (default)
+
+Run `gdt` in any directory to pick a theme for it:
 
 ```bash
 ~/.config/ghostty-dir-themes/gdt
 ```
 
-### TUI Controls
+| Key | Action |
+|-----|--------|
+| `Left` / `Right` (or `h` / `l`) | Cycle through themes (live preview) |
+| `Enter` | Save mapping and keep theme |
+| `q` / `Esc` | Quit without saving (restores previous theme) |
+
+### Full-Screen TUI
+
+Use `--all` to manage all directory mappings at once:
+
+```bash
+~/.config/ghostty-dir-themes/gdt --all
+```
 
 | Key | Action |
 |-----|--------|
@@ -51,15 +65,7 @@ Launch the TUI:
 | `s` | Save mappings and regenerate the hook |
 | `q` | Quit (auto-saves if there are changes) |
 
-In the theme carousel:
-
-| Key | Action |
-|-----|--------|
-| `Left` / `Right` | Cycle through available Ghostty themes |
-| `Enter` | Confirm selection |
-| `Esc` | Cancel |
-
-### Regenerate Hook Without TUI
+### Regenerate Hook
 
 ```bash
 ~/.config/ghostty-dir-themes/gdt --generate-hook

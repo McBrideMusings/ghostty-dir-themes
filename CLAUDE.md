@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ghostty-dir-themes (gdt) — a Python curses TUI that manages per-directory color themes for the Ghostty terminal. When you `cd` into a mapped directory, the terminal colors change automatically via OSC escape sequences.
+ghostty-dir-themes (gdt) — manages per-directory color themes for the Ghostty terminal. When you `cd` into a mapped directory, the terminal colors change automatically via OSC escape sequences. Default mode is a lightweight inline picker; `--all` opens the full curses TUI.
 
 ## How It Works
 
 1. **`themes.json`** — theme definitions (name → `{bg, fg, cursor}` hex colors)
 2. **`mappings.json`** — directory-to-theme associations (`[{directory, theme}]`)
-3. **`gdt`** — Python 3 TUI (curses-based) for managing mappings; also generates the hook
+3. **`gdt`** — Python 3 script; inline picker (default), full curses TUI (`--all`), hook generator (`--generate-hook`)
 4. **`hook.zsh`** — auto-generated zsh script sourced from `.zshrc`; uses a `chpwd` hook to apply themes on directory change
 
 Flow: user edits mappings in TUI → on save, `hook.zsh` is regenerated with a `case` statement → zsh sources it and applies OSC colors on `cd`.
@@ -18,10 +18,13 @@ Flow: user edits mappings in TUI → on save, `hook.zsh` is regenerated with a `
 ## Running
 
 ```bash
-# Launch the TUI
+# Inline picker for current directory (default)
 ./gdt
 
-# Regenerate hook.zsh without the TUI
+# Full-screen TUI for managing all mappings
+./gdt --all
+
+# Regenerate hook.zsh without any UI
 ./gdt --generate-hook
 ```
 

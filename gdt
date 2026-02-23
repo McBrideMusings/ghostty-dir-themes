@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """ghostty-dir-themes (gdt) - TUI for managing per-directory Ghostty color themes."""
 
+import argparse
 import curses
 import json
 import os
+import select
 import sys
 import subprocess
 import glob
 import random
+import termios
 import threading
+import tty
 
 CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
 MAPPINGS_FILE = os.path.join(CONFIG_DIR, "mappings.json")
@@ -288,6 +292,145 @@ def batch_fill(root, mappings, theme_names):
         added += 1
 
     return added
+
+
+# --- Inline picker ---
+
+def _has_more_input(fd, timeout=0.05):
+    """Check if there are more bytes pending on fd (for escape sequence detection)."""
+    r, _, _ = select.select([fd], [], [], timeout)
+    return bool(r)
+
+
+def run_inline():
+    """Lightweight inline theme picker for the current directory."""
+    themes = discover_themes()
+    theme_names = sorted(themes.keys())
+    if not theme_names:
+        print("No themes found.")
+        return
+
+    mappings = load_mappings()
+    cwd = os.getcwd()
+
+    # Find existing mapping for current directory
+    idx = 0
+    for m in mappings:
+        if cwd == m["directory"] or cwd.startswith(m["directory"].rstrip("/") + "/"):
+            if m["theme"] in theme_names:
+                idx = theme_names.index(m["theme"])
+            break
+
+    # Shorten path for display
+    home = os.path.expanduser("~")
+    display_path = cwd.replace(home, "~") if cwd.startswith(home) else cwd
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    # Print initial blank lines to reserve space
+    sys.stdout.write("\n\n\n")
+    sys.stdout.flush()
+
+    def render():
+        name = theme_names[idx]
+        counter = f"({idx + 1}/{len(theme_names)})"
+        line = f"  \u25c0  {name}  {counter}  \u25b6"
+        footer = "  \u2190/\u2192 cycle   Enter save   q/Esc quit"
+        sys.stdout.write(f"\033[3A\r\033[K\n\033[K{line}\n\033[K{footer}\n")
+        sys.stdout.flush()
+
+    def render_spinner(frame):
+        spinner = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+        ch = spinner[frame % len(spinner)]
+        sys.stdout.write(f"\033[3A\r\033[K\n\033[K  {ch} Saving\u2026\n\033[K\n")
+        sys.stdout.flush()
+
+    def clear_and_print(msg):
+        sys.stdout.write(f"\033[3A\r\033[K\n\033[K{msg}\n\033[K\n")
+        sys.stdout.flush()
+
+    # Find the existing saved theme for this directory (to restore on quit)
+    saved_theme = None
+    for m in mappings:
+        if cwd == m["directory"] or cwd.startswith(m["directory"].rstrip("/") + "/"):
+            saved_theme = themes.get(m["theme"])
+            break
+
+    def restore_or_reset():
+        if saved_theme:
+            osc_set_colors(saved_theme)
+        else:
+            osc_reset()
+
+    try:
+        tty.setcbreak(fd)
+        osc_set_colors(themes[theme_names[idx]])
+        render()
+
+        while True:
+            ch = os.read(fd, 1)
+            if not ch:
+                break
+            c = ch[0]
+
+            if c == 0x1b:  # Escape or arrow key
+                if _has_more_input(fd):
+                    seq = os.read(fd, 2)
+                    if seq == b"[D" or seq == b"[h":  # Left
+                        idx = (idx - 1) % len(theme_names)
+                    elif seq == b"[C" or seq == b"[l":  # Right
+                        idx = (idx + 1) % len(theme_names)
+                else:
+                    # Bare Esc — quit without saving
+                    restore_or_reset()
+                    clear_and_print("  gdt quit without saving")
+                    return
+            elif c == ord("h"):
+                idx = (idx - 1) % len(theme_names)
+            elif c == ord("l"):
+                idx = (idx + 1) % len(theme_names)
+            elif c == ord("q"):
+                restore_or_reset()
+                clear_and_print("  gdt quit without saving")
+                return
+            elif c in (10, 13):  # Enter — save
+                chosen = theme_names[idx]
+                # Update or add mapping
+                found = False
+                for m in mappings:
+                    if m["directory"] == cwd:
+                        m["theme"] = chosen
+                        found = True
+                        break
+                if not found:
+                    mappings.append({"directory": cwd, "theme": chosen})
+
+                # Save with spinner
+                save_done = threading.Event()
+                def _save_worker():
+                    save_mappings(mappings)
+                    generate_hook()
+                    broadcast_updates(mappings, themes)
+                    save_done.set()
+
+                thread = threading.Thread(target=_save_worker, daemon=True)
+                thread.start()
+                frame = 0
+                while not save_done.is_set():
+                    render_spinner(frame)
+                    frame += 1
+                    save_done.wait(timeout=0.08)
+
+                clear_and_print(f"  {display_path} \u2192 {chosen}")
+                return
+            else:
+                continue
+
+            osc_set_colors(themes[theme_names[idx]])
+            render()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 # --- Curses TUI ---
@@ -650,7 +793,12 @@ class TUI:
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "--generate-hook":
+    parser = argparse.ArgumentParser(description="Manage per-directory Ghostty color themes")
+    parser.add_argument("--generate-hook", action="store_true", help="Regenerate hook.zsh and exit")
+    parser.add_argument("--all", action="store_true", help="Open full-screen TUI to manage all mappings")
+    args = parser.parse_args()
+
+    if args.generate_hook:
         generate_hook()
         print(f"Generated: {HOOK_FILE}")
         return
@@ -659,11 +807,13 @@ def main():
     if not os.path.exists(MAPPINGS_FILE):
         save_mappings([])
 
-    def run_tui(stdscr):
-        tui = TUI(stdscr)
-        tui.run()
-
-    curses.wrapper(run_tui)
+    if args.all:
+        def run_tui(stdscr):
+            tui = TUI(stdscr)
+            tui.run()
+        curses.wrapper(run_tui)
+    else:
+        run_inline()
 
 
 if __name__ == "__main__":
