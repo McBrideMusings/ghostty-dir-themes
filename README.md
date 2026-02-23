@@ -18,13 +18,6 @@ brew tap McBrideMusings/tap
 brew install gdt
 ```
 
-### apt (Debian/Ubuntu)
-
-```bash
-echo "deb [trusted=yes] https://McBrideMusings.github.io/apt-repo stable main" | sudo tee /etc/apt/sources.list.d/gdt.list
-sudo apt update && sudo apt install gdt
-```
-
 ### Manual (git clone)
 
 ```bash

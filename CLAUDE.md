@@ -8,10 +8,11 @@ ghostty-dir-themes (gdt) — manages per-directory color themes for the Ghostty 
 
 ## How It Works
 
-1. **`themes.json`** — theme definitions (name → `{bg, fg, cursor}` hex colors)
-2. **`mappings.json`** — directory-to-theme associations (`[{directory, theme}]`)
-3. **`gdt`** — Python 3 script; inline picker (default), full curses TUI (`--all`), hook generator (`--generate-hook`)
-4. **`hook.zsh`** — auto-generated zsh script sourced from `.zshrc`; uses a `chpwd` hook to apply themes on directory change
+1. **`mappings.json`** — directory-to-theme associations (`[{directory, theme}]`), stored in `~/.config/gdt/`
+2. **`gdt`** — Python 3 script; inline picker (default), full curses TUI (`--all`), hook generator (`--generate-hook`), theme refresh (`--refresh`)
+3. **`hook.zsh`** — auto-generated zsh script sourced from `.zshrc`; uses a `chpwd` hook to apply themes on directory change
+
+Themes are discovered from Ghostty's built-in and user theme directories, not stored in this repo.
 
 Flow: user edits mappings in TUI → on save, `hook.zsh` is regenerated with a `case` statement → zsh sources it and applies OSC colors on `cd`.
 
@@ -26,13 +27,25 @@ Flow: user edits mappings in TUI → on save, `hook.zsh` is regenerated with a `
 
 # Regenerate hook.zsh without any UI
 ./gdt --generate-hook
+
+# Reapply the theme for the current directory
+./gdt --refresh
+
+# Print version
+./gdt --version
 ```
 
 No dependencies beyond Python 3 stdlib. No build step, no tests, no linting configured.
 
 ## Key Architecture Details
 
-- All files live in the same directory; `CONFIG_DIR` is derived from the script's own location
+- Config lives in `~/.config/gdt/` (XDG-compliant), overridable via `$GDT_CONFIG_DIR` env var
 - OSC sequences target `/dev/tty` (or `$TTY`) to change bg (OSC 11), fg (OSC 10), and cursor color (OSC 12)
 - The "broadcast" feature (`broadcast_updates`) uses `lsof` to find other zsh ttys and push color updates to them
 - `hook.zsh` is a pure shell script with no runtime dependency on Python — it's fully self-contained after generation
+
+## Distribution
+
+- **Homebrew**: `Formula/gdt.rb` is a reference copy; the live formula lives in the `McBrideMusings/homebrew-tap` repo
+- **Release workflow**: `.github/workflows/release.yml` triggers on `v*` tags — creates a GitHub Release and auto-updates the Homebrew tap
+- **apt/deb**: tracked in issue #1, not yet implemented
