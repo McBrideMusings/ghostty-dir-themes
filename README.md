@@ -11,23 +11,36 @@ Manage per-directory color themes for the [Ghostty](https://ghostty.org) termina
 
 ## Installation
 
-Clone the repo anywhere you like:
+### Homebrew (macOS)
 
 ```bash
-git clone https://github.com/user/ghostty-dir-themes.git ~/.config/ghostty-dir-themes
+brew tap McBrideMusings/tap
+brew install gdt
 ```
 
-Make sure the `gdt` script is executable:
+### apt (Debian/Ubuntu)
 
 ```bash
-chmod +x ~/.config/ghostty-dir-themes/gdt
+echo "deb [trusted=yes] https://McBrideMusings.github.io/apt-repo stable main" | sudo tee /etc/apt/sources.list.d/gdt.list
+sudo apt update && sudo apt install gdt
 ```
 
-Generate the shell hook and source it from your `.zshrc`:
+### Manual (git clone)
 
 ```bash
-~/.config/ghostty-dir-themes/gdt --generate-hook
-echo 'source ~/.config/ghostty-dir-themes/hook.zsh' >> ~/.zshrc
+git clone https://github.com/McBrideMusings/ghostty-dir-themes.git
+cd ghostty-dir-themes
+chmod +x gdt
+sudo ln -s "$(pwd)/gdt" /usr/local/bin/gdt
+```
+
+### Shell Hook Setup
+
+After installing, generate the hook and source it from your `.zshrc`:
+
+```bash
+gdt --generate-hook
+echo 'source ~/.config/gdt/hook.zsh' >> ~/.zshrc
 ```
 
 Restart your shell or run `source ~/.zshrc`.
@@ -39,7 +52,7 @@ Restart your shell or run `source ~/.zshrc`.
 Run `gdt` in any directory to pick a theme for it:
 
 ```bash
-~/.config/ghostty-dir-themes/gdt
+gdt
 ```
 
 | Key | Action |
@@ -53,7 +66,7 @@ Run `gdt` in any directory to pick a theme for it:
 Use `--all` to manage all directory mappings at once:
 
 ```bash
-~/.config/ghostty-dir-themes/gdt --all
+gdt --all
 ```
 
 | Key | Action |
@@ -68,8 +81,15 @@ Use `--all` to manage all directory mappings at once:
 ### Regenerate Hook
 
 ```bash
-~/.config/ghostty-dir-themes/gdt --generate-hook
+gdt --generate-hook
 ```
+
+## Configuration
+
+gdt stores its configuration in `~/.config/gdt/` (or `$XDG_CONFIG_HOME/gdt/`). You can override this with the `GDT_CONFIG_DIR` environment variable.
+
+- `~/.config/gdt/mappings.json` — directory-to-theme associations
+- `~/.config/gdt/hook.zsh` — auto-generated zsh hook (sourced from `.zshrc`)
 
 ## How It Works
 
