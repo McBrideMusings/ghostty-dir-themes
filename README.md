@@ -4,7 +4,7 @@ A curses TUI that manages per-directory color themes for the [Ghostty](https://g
 
 ## Requirements
 
-- macOS (Linux support is possible but untested)
+- macOS or Linux
 - Python 3 (stdlib only, no pip dependencies)
 - [Ghostty](https://ghostty.org) terminal
 - zsh
@@ -77,9 +77,10 @@ In the theme carousel:
 
 gdt discovers themes from two locations:
 
-- **Built-in:** `/Applications/Ghostty.app/Contents/Resources/ghostty/themes`
+- **Built-in (macOS):** `/Applications/Ghostty.app/Contents/Resources/ghostty/themes`
+- **Built-in (Linux):** `/usr/share/ghostty/themes`
 - **User:** `~/.config/ghostty/themes/`
 
 ## Platform Support
 
-gdt currently works on **macOS** with **zsh**. It relies on `/dev/tty` for OSC output, `lsof` for broadcasting theme changes to other terminals, and the macOS Ghostty.app bundle path for theme discovery. Windows is not supported.
+gdt works on **macOS** and **Linux** with **zsh**. It relies on `/dev/tty` for OSC output, `lsof` for broadcasting theme changes to other terminals, and platform-specific paths for theme discovery. Windows is not supported.

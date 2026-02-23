@@ -14,7 +14,12 @@ CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
 MAPPINGS_FILE = os.path.join(CONFIG_DIR, "mappings.json")
 HOOK_FILE = os.path.join(CONFIG_DIR, "hook.zsh")
 
-GHOSTTY_BUILTIN_THEMES = "/Applications/Ghostty.app/Contents/Resources/ghostty/themes"
+if sys.platform == "darwin":
+    GHOSTTY_BUILTIN_THEMES = "/Applications/Ghostty.app/Contents/Resources/ghostty/themes"
+elif sys.platform.startswith("linux"):
+    GHOSTTY_BUILTIN_THEMES = "/usr/share/ghostty/themes"
+else:
+    GHOSTTY_BUILTIN_THEMES = ""
 GHOSTTY_USER_THEMES = os.path.expanduser("~/.config/ghostty/themes")
 
 
@@ -142,7 +147,7 @@ def broadcast_updates(mappings, themes):
 
     ttys = set()
     for line in result.stdout.splitlines():
-        if line.startswith("n/dev/ttys"):
+        if line.startswith("n/dev/ttys") or line.startswith("n/dev/pts/"):
             ttys.add(line[1:])
 
     updated = 0
