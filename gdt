@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""ghostty-dir-themes (gdt) - TUI for managing per-directory Ghostty color themes."""
+
+import curses
+import json
+import os
+import sys
+import subprocess
+import glob
+import random
+import threading
+
+CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
+MAPPINGS_FILE = os.path.join(CONFIG_DIR, "mappings.json")
+HOOK_FILE = os.path.join(CONFIG_DIR, "hook.zsh")
+
+GHOSTTY_BUILTIN_THEMES = "/Applications/Ghostty.app/Contents/Resources/ghostty/themes"
+GHOSTTY_USER_THEMES = os.path.expanduser("~/.config/ghostty/themes")
+
+
+def load_json(path, default=None):
+    if default is None:
+        default = {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def parse_theme_file(path):
+    """Parse a Ghostty theme file (key=value format) into a dict."""
+    theme = {}
+    palette = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip()
+                if key == "palette":
+                    idx, _, color = value.partition("=")
+                    palette[int(idx)] = color
+                elif key == "background":
+                    theme["background"] = value
+                elif key == "foreground":
+                    theme["foreground"] = value
+                elif key == "cursor-color":
+                    theme["cursor-color"] = value
+                elif key == "selection-background":
+                    theme["selection-background"] = value
+                elif key == "selection-foreground":
+                    theme["selection-foreground"] = value
+    except (IOError, OSError):
+        return None
+    if not theme.get("background") or not theme.get("foreground"):
+        return None
+    if palette:
+        theme["palette"] = palette
+    return theme
+
+
+def discover_themes():
+    """Scan Ghostty built-in and user theme directories."""
+    themes = {}
+    for theme_dir in (GHOSTTY_BUILTIN_THEMES, GHOSTTY_USER_THEMES):
+        if not os.path.isdir(theme_dir):
+            continue
+        for entry in os.listdir(theme_dir):
+            path = os.path.join(theme_dir, entry)
+            if not os.path.isfile(path):
+                continue
+            theme = parse_theme_file(path)
+            if theme:
+                themes[entry] = theme
+    return themes
+
+
+def load_mappings():
+    return load_json(MAPPINGS_FILE, default=[])
+
+
+def save_mappings(mappings):
+    save_json(MAPPINGS_FILE, mappings)
+
+
+# --- OSC helpers (emit to current terminal) ---
+
+def osc_set_colors(theme):
+    """Emit OSC sequences to apply a full theme to the current terminal."""
+    _osc_write_theme(os.environ.get("TTY") or "/dev/tty", theme)
+
+
+def _osc_write_theme(tty_path, theme):
+    """Write OSC sequences for a theme to a tty path."""
+    try:
+        with open(tty_path, "w") as t:
+            t.write(f"\033]11;{theme['background']}\033\\")
+            t.write(f"\033]10;{theme['foreground']}\033\\")
+            if "cursor-color" in theme:
+                t.write(f"\033]12;{theme['cursor-color']}\033\\")
+            for idx, color in sorted(theme.get("palette", {}).items()):
+                t.write(f"\033]4;{idx};{color}\033\\")
+            t.flush()
+    except (IOError, OSError):
+        pass
+
+
+def osc_reset():
+    """Reset terminal colors to Ghostty config defaults."""
+    tty = os.environ.get("TTY") or "/dev/tty"
+    try:
+        with open(tty, "w") as t:
+            t.write("\033]110\033\\")
+            t.write("\033]111\033\\")
+            t.write("\033]112\033\\")
+            t.write("\033]104\033\\")
+            t.flush()
+    except (IOError, OSError):
+        pass
+
+
+def broadcast_updates(mappings, themes):
+    """Try to update colors in other running Ghostty terminals."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-c", "zsh", "+D", "/dev/", "-Fn"],
+            capture_output=True, text=True, timeout=3
+        )
+    except Exception:
+        return 0
+
+    ttys = set()
+    for line in result.stdout.splitlines():
+        if line.startswith("n/dev/ttys"):
+            ttys.add(line[1:])
+
+    updated = 0
+    for tty_path in ttys:
+        try:
+            lsof_tty = subprocess.run(
+                ["lsof", "-t", tty_path],
+                capture_output=True, text=True, timeout=2
+            )
+            pids = lsof_tty.stdout.strip().splitlines()
+            for pid in pids:
+                try:
+                    cwd_link = f"/proc/{pid}/cwd"
+                    if os.path.exists(cwd_link):
+                        cwd = os.readlink(cwd_link)
+                    else:
+                        lsof_cwd = subprocess.run(
+                            ["lsof", "-p", pid, "-Fn", "-d", "cwd"],
+                            capture_output=True, text=True, timeout=2
+                        )
+                        cwd = None
+                        for l in lsof_cwd.stdout.splitlines():
+                            if l.startswith("n/"):
+                                cwd = l[1:]
+                        if not cwd:
+                            continue
+
+                    for m in mappings:
+                        if cwd.startswith(m["directory"]):
+                            theme = themes.get(m["theme"])
+                            if theme:
+                                _osc_write_theme(tty_path, theme)
+                                updated += 1
+                            break
+                except (IOError, OSError, subprocess.TimeoutExpired):
+                    continue
+        except (IOError, OSError, subprocess.TimeoutExpired):
+            continue
+    return updated
+
+
+def _hook_theme_block(theme):
+    """Generate shell commands to apply a full theme's OSC sequences."""
+    cmds = []
+    cmds.append(f'printf "\\033]11;{theme["background"]}\\033\\\\"')
+    cmds.append(f'printf "\\033]10;{theme["foreground"]}\\033\\\\"')
+    if "cursor-color" in theme:
+        cmds.append(f'printf "\\033]12;{theme["cursor-color"]}\\033\\\\"')
+    for idx, color in sorted(theme.get("palette", {}).items()):
+        cmds.append(f'printf "\\033]4;{idx};{color}\\033\\\\"')
+    return cmds
+
+
+def generate_hook():
+    """Generate the zsh hook script from current mappings."""
+    mappings = load_mappings()
+    themes = discover_themes()
+
+    lines = [
+        '# Auto-generated by ghostty-dir-themes — do not edit manually',
+        '# Sourced from .zshrc to apply per-directory Ghostty themes',
+        '',
+        '_gdt_reset_theme() {',
+        '  printf "\\033]110\\033\\\\"',
+        '  printf "\\033]111\\033\\\\"',
+        '  printf "\\033]112\\033\\\\"',
+        '  printf "\\033]104\\033\\\\"',
+        '}',
+        '',
+        '_gdt_dir_theme() {',
+        '  case "$PWD" in',
+    ]
+
+    for m in mappings:
+        theme = themes.get(m["theme"])
+        if theme:
+            d = m["directory"].rstrip("/")
+            lines.append(f'    {d}*)')
+            for cmd in _hook_theme_block(theme):
+                lines.append(f'      {cmd}')
+            lines.append('      ;;')
+
+    lines += [
+        '    *)',
+        '      _gdt_reset_theme',
+        '      ;;',
+        '  esac',
+        '}',
+        '',
+        'if [[ "$TERM_PROGRAM" == "ghostty" ]]; then',
+        '  autoload -Uz add-zsh-hook',
+        '  add-zsh-hook chpwd _gdt_dir_theme',
+        '  _gdt_dir_theme',
+        'fi',
+        '',
+    ]
+
+    with open(HOOK_FILE, "w") as f:
+        f.write("\n".join(lines))
+
+
+def batch_fill(root, mappings, theme_names):
+    """Add mappings for all immediate subdirectories of root that aren't already mapped."""
+    root = os.path.expanduser(root)
+    root = os.path.abspath(root)
+
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return 0
+
+    subdirs = sorted(
+        e for e in entries
+        if os.path.isdir(os.path.join(root, e)) and not e.startswith(".")
+    )
+
+    mapped_dirs = {m["directory"] for m in mappings}
+    used_themes = {m["theme"] for m in mappings}
+
+    available = [t for t in theme_names if t not in used_themes]
+    random.shuffle(available)
+
+    batch_used = set()
+    added = 0
+    for subdir in subdirs:
+        full_path = os.path.join(root, subdir)
+        if full_path in mapped_dirs:
+            continue
+
+        if not available:
+            refill = [t for t in theme_names if t not in batch_used]
+            random.shuffle(refill)
+            available = refill
+
+        theme = available.pop() if available else theme_names[0]
+        batch_used.add(theme)
+        mappings.append({"directory": full_path, "theme": theme})
+        added += 1
+
+    return added
+
+
+# --- Curses TUI ---
+
+class TUI:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.themes = discover_themes()
+        self.theme_names = sorted(self.themes.keys())
+        self.mappings = load_mappings()
+        self.cursor = 0
+        self.mode = "main"  # main, add_dir, batch_dir, carousel
+        self.input_buf = ""
+        self.carousel_idx = 0
+        self.status = ""
+        self.dirty = False
+        self.original_mappings = json.dumps(self.mappings)
+        self.scroll_offset = 0
+        self._save_frame = 0
+        self._save_result = None
+
+    def run(self):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        self.stdscr.timeout(-1)
+        self.stdscr.keypad(True)
+        self.preview_current_mapping()
+
+        while True:
+            self.draw()
+            key = self.stdscr.getch()
+
+            if self.mode == "main":
+                if not self.handle_main(key):
+                    break
+            elif self.mode == "add_dir":
+                self.handle_add_dir(key)
+            elif self.mode == "batch_dir":
+                self.handle_batch_dir(key)
+            elif self.mode == "carousel":
+                self.handle_carousel(key)
+
+        # On exit: save if dirty, generate hook, reset preview
+        if self.dirty:
+            save_mappings(self.mappings)
+            generate_hook()
+            self.status = "Saved."
+        osc_reset()
+
+    def draw(self):
+        self.stdscr.erase()
+        h, w = self.stdscr.getmaxyx()
+
+        saving = self.mode == "saving"
+        dim = curses.A_DIM if saving else 0
+
+        # Title
+        title = " ghostty-dir-themes "
+        title_attr = (curses.A_DIM) if saving else (curses.A_BOLD | curses.A_REVERSE)
+        self.stdscr.addstr(0, max(0, (w - len(title)) // 2), title, title_attr)
+
+        # Column headers
+        y = 2
+        hdr = f"  {'Directory':<45} {'Theme':<20}"
+        self.stdscr.addstr(y, 0, hdr[:w-1], curses.A_DIM)
+        self.stdscr.addstr(y + 1, 0, "─" * min(70, w - 1), curses.A_DIM)
+        y += 2
+
+        # Mappings list
+        page_size = self._page_size()
+        if not self.mappings:
+            self.stdscr.addstr(y, 2, "(no mappings — press 'a' to add one)", curses.A_DIM)
+            y += 1
+        else:
+            end = min(len(self.mappings), self.scroll_offset + page_size)
+            for i in range(self.scroll_offset, end):
+                m = self.mappings[i]
+                prefix = "▸ " if i == self.cursor else "  "
+                attr = curses.A_DIM if saving else (curses.A_BOLD if i == self.cursor else 0)
+
+                # If in carousel mode on this row, show carousel state
+                if self.mode == "carousel" and i == self.cursor:
+                    tname = self.theme_names[self.carousel_idx]
+                    line = f"{prefix}{m['directory']:<45} ◀ {tname:<16} ▶"
+                    self.stdscr.addstr(y, 0, line[:w-1], attr | curses.A_REVERSE)
+                else:
+                    line = f"{prefix}{m['directory']:<45} {m['theme']:<20}"
+                    self.stdscr.addstr(y, 0, line[:w-1], attr)
+                y += 1
+
+            # Page indicator
+            total_pages = (len(self.mappings) + page_size - 1) // page_size
+            if total_pages > 1:
+                current_page = self.scroll_offset // page_size + 1
+                indicator = f"Page {current_page}/{total_pages}  (←→ page, ↑↓ navigate)"
+                self.stdscr.addstr(y, 2, indicator[:w-3], curses.A_DIM)
+
+        # Saving overlay
+        if saving:
+            spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            frame = spinner[self._save_frame % len(spinner)]
+            msg = f" {frame} Saving & broadcasting… "
+            cy = h // 2
+            cx = max(0, (w - len(msg)) // 2)
+            self.stdscr.addstr(cy, cx, msg, curses.A_BOLD)
+
+        # Status bar
+        status_y = h - 3
+        if self.status:
+            self.stdscr.addstr(status_y, 0, self.status[:w-1], curses.A_DIM)
+
+        # Mode-specific footer
+        footer_y = h - 1
+        if self.mode == "saving":
+            foot = " Saving… please wait "
+            self.stdscr.addstr(footer_y, 0, foot[:w-1], curses.A_DIM | curses.A_REVERSE)
+        elif self.mode == "main":
+            total_pages = (max(len(self.mappings), 1) + page_size - 1) // page_size
+            if total_pages > 1:
+                foot = " ↑↓ Navigate  ←→ Page  a Add  b Batch  d Delete  Enter Edit theme  s Save  q Quit "
+            else:
+                foot = " ↑↓ Navigate  a Add  b Batch  d Delete  Enter Edit theme  s Save  q Quit "
+            self.stdscr.addstr(footer_y, 0, foot[:w-1], curses.A_REVERSE)
+        elif self.mode in ("add_dir", "batch_dir"):
+            label = "Directory path" if self.mode == "add_dir" else "Batch root"
+            prompt = f" {label}: {self.input_buf}█ "
+            self.stdscr.addstr(footer_y, 0, prompt[:w-1], curses.A_REVERSE)
+        elif self.mode == "carousel":
+            foot = " ◀▶ Cycle themes  Enter Confirm  Esc Cancel "
+            self.stdscr.addstr(footer_y, 0, foot[:w-1], curses.A_REVERSE)
+
+        self.stdscr.refresh()
+
+    def preview_current_mapping(self):
+        """Preview the theme for the currently selected mapping."""
+        if self.mappings:
+            tname = self.mappings[self.cursor]["theme"]
+            theme = self.themes.get(tname)
+            if theme:
+                osc_set_colors(theme)
+
+    def _page_size(self):
+        h, _ = self.stdscr.getmaxyx()
+        return max(1, h - 8)
+
+    def _ensure_cursor_visible(self):
+        ps = self._page_size()
+        if self.cursor < self.scroll_offset:
+            self.scroll_offset = self.cursor
+        elif self.cursor >= self.scroll_offset + ps:
+            self.scroll_offset = self.cursor - ps + 1
+
+    def do_save_async(self):
+        """Run save/hook/broadcast in a background thread with spinner."""
+        self._save_frame = 0
+        self._save_result = None
+        self.mode = "saving"
+
+        def _worker():
+            save_mappings(self.mappings)
+            generate_hook()
+            count = broadcast_updates(self.mappings, self.themes)
+            self._save_result = count
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+
+        self.stdscr.timeout(80)
+        while thread.is_alive():
+            self.draw()
+            self._save_frame += 1
+            self.stdscr.getch()  # discard input during save
+        self.stdscr.timeout(-1)
+
+        self.dirty = False
+        self.mode = "main"
+        count = self._save_result or 0
+        self.status = f"Saved & hook regenerated. Broadcast to {count} terminal(s)."
+
+    def handle_main(self, key):
+        if key == ord("q"):
+            return False
+        elif key == ord("s"):
+            self.do_save_async()
+        elif key == curses.KEY_UP:
+            if self.mappings:
+                self.cursor = max(0, self.cursor - 1)
+                self._ensure_cursor_visible()
+                self.preview_current_mapping()
+        elif key == curses.KEY_DOWN:
+            if self.mappings:
+                self.cursor = min(len(self.mappings) - 1, self.cursor + 1)
+                self._ensure_cursor_visible()
+                self.preview_current_mapping()
+        elif key == curses.KEY_LEFT:
+            if self.mappings:
+                self.cursor = max(0, self.cursor - self._page_size())
+                self._ensure_cursor_visible()
+                self.preview_current_mapping()
+        elif key == curses.KEY_RIGHT:
+            if self.mappings:
+                self.cursor = min(len(self.mappings) - 1, self.cursor + self._page_size())
+                self._ensure_cursor_visible()
+                self.preview_current_mapping()
+        elif key == ord("a"):
+            self.mode = "add_dir"
+            self.input_buf = ""
+            self.status = "Enter directory path (tab to complete, enter to confirm)"
+            curses.curs_set(1)
+        elif key == ord("b"):
+            self.mode = "batch_dir"
+            self.input_buf = ""
+            self.status = "Enter root directory to batch-fill (tab to complete)"
+            curses.curs_set(1)
+        elif key == ord("d"):
+            if self.mappings:
+                removed = self.mappings.pop(self.cursor)
+                self.cursor = min(self.cursor, max(0, len(self.mappings) - 1))
+                self._ensure_cursor_visible()
+                self.dirty = True
+                self.status = f"Removed: {removed['directory']}"
+        elif key in (ord("\n"), curses.KEY_ENTER, 10, 13, ord("e")):
+            if self.mappings:
+                self.enter_carousel()
+        return True
+
+    def enter_carousel(self):
+        self.mode = "carousel"
+        current_theme = self.mappings[self.cursor]["theme"]
+        if current_theme in self.theme_names:
+            self.carousel_idx = self.theme_names.index(current_theme)
+        else:
+            self.carousel_idx = 0
+        self.preview_carousel_theme()
+
+    def preview_carousel_theme(self):
+        tname = self.theme_names[self.carousel_idx]
+        theme = self.themes[tname]
+        osc_set_colors(theme)
+        self.status = f"Preview: {tname}  ({self.carousel_idx + 1}/{len(self.theme_names)})"
+
+    def handle_carousel(self, key):
+        if key in (curses.KEY_LEFT, ord("h")):
+            self.carousel_idx = (self.carousel_idx - 1) % len(self.theme_names)
+            self.preview_carousel_theme()
+        elif key in (curses.KEY_RIGHT, ord("l")):
+            self.carousel_idx = (self.carousel_idx + 1) % len(self.theme_names)
+            self.preview_carousel_theme()
+        elif key in (ord("\n"), curses.KEY_ENTER, 10, 13):
+            tname = self.theme_names[self.carousel_idx]
+            self.mappings[self.cursor]["theme"] = tname
+            self.dirty = True
+            self.mode = "main"
+            self.preview_current_mapping()
+            self.status = f"Set theme: {tname}"
+        elif key == 27:  # Esc
+            self.mode = "main"
+            osc_reset()
+            self.status = "Cancelled."
+
+    def handle_add_dir(self, key):
+        if key in (ord("\n"), curses.KEY_ENTER, 10, 13):
+            curses.curs_set(0)
+            path = self.input_buf.strip()
+            if not path:
+                self.mode = "main"
+                self.status = "Cancelled (empty path)."
+                return
+
+            path = os.path.expanduser(path)
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+
+            # Check for duplicate
+            for m in self.mappings:
+                if m["directory"] == path:
+                    self.mode = "main"
+                    self.status = f"Already mapped: {path}"
+                    return
+
+            self.mappings.append({"directory": path, "theme": self.theme_names[0]})
+            self.cursor = len(self.mappings) - 1
+            self._ensure_cursor_visible()
+            self.dirty = True
+            self.mode = "main"
+            self.status = f"Added: {path} — press Enter to pick a theme"
+
+        elif key == 27:  # Esc
+            curses.curs_set(0)
+            self.mode = "main"
+            self.status = "Cancelled."
+
+        elif key == 9:  # Tab — basic path completion
+            partial = os.path.expanduser(self.input_buf)
+            matches = glob.glob(partial + "*")
+            dirs = [m + "/" for m in matches if os.path.isdir(m)]
+            if len(dirs) == 1:
+                self.input_buf = dirs[0]
+            elif len(dirs) > 1:
+                # Find common prefix
+                prefix = os.path.commonprefix(dirs)
+                self.input_buf = prefix
+                self.status = f"{len(dirs)} matches"
+
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            self.input_buf = self.input_buf[:-1]
+
+        elif 32 <= key <= 126:
+            self.input_buf += chr(key)
+
+
+    def handle_batch_dir(self, key):
+        if key in (ord("\n"), curses.KEY_ENTER, 10, 13):
+            curses.curs_set(0)
+            path = self.input_buf.strip()
+            if not path:
+                self.mode = "main"
+                self.status = "Cancelled (empty path)."
+                return
+
+            path = os.path.expanduser(path)
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+
+            if not os.path.isdir(path):
+                self.mode = "main"
+                self.status = f"Not a directory: {path}"
+                return
+
+            count = batch_fill(path, self.mappings, self.theme_names)
+            if count > 0:
+                self.cursor = len(self.mappings) - 1
+                self._ensure_cursor_visible()
+                self.dirty = True
+            self.mode = "main"
+            display_path = path.replace(os.path.expanduser("~"), "~")
+            self.status = f"Added {count} directories from {display_path}"
+
+        elif key == 27:  # Esc
+            curses.curs_set(0)
+            self.mode = "main"
+            self.status = "Cancelled."
+
+        elif key == 9:  # Tab — basic path completion
+            partial = os.path.expanduser(self.input_buf)
+            matches = glob.glob(partial + "*")
+            dirs = [m + "/" for m in matches if os.path.isdir(m)]
+            if len(dirs) == 1:
+                self.input_buf = dirs[0]
+            elif len(dirs) > 1:
+                prefix = os.path.commonprefix(dirs)
+                self.input_buf = prefix
+                self.status = f"{len(dirs)} matches"
+
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            self.input_buf = self.input_buf[:-1]
+
+        elif 32 <= key <= 126:
+            self.input_buf += chr(key)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--generate-hook":
+        generate_hook()
+        print(f"Generated: {HOOK_FILE}")
+        return
+
+    # Ensure mappings file exists
+    if not os.path.exists(MAPPINGS_FILE):
+        save_mappings([])
+
+    def run_tui(stdscr):
+        tui = TUI(stdscr)
+        tui.run()
+
+    curses.wrapper(run_tui)
+
+
+if __name__ == "__main__":
+    main()
