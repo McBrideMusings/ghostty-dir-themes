@@ -4,6 +4,7 @@
 import argparse
 import curses
 import json
+import logging
 import os
 import select
 import sys
@@ -26,7 +27,16 @@ CONFIG_DIR = os.environ.get("GDT_CONFIG_DIR") or os.path.join(
 )
 MAPPINGS_FILE = os.path.join(CONFIG_DIR, "mappings.json")
 HOOK_FILE = os.path.join(CONFIG_DIR, "hook.zsh")
+LOG_FILE = os.path.join(CONFIG_DIR, "gdt.log")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# --- Logging setup ---
+os.makedirs(CONFIG_DIR, exist_ok=True)
+log = logging.getLogger("gdt")
+log.setLevel(logging.DEBUG)
+_log_handler = logging.FileHandler(LOG_FILE)
+_log_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+log.addHandler(_log_handler)
 
 if sys.platform == "darwin":
     GHOSTTY_BUILTIN_THEMES = "/Applications/Ghostty.app/Contents/Resources/ghostty/themes"
@@ -197,6 +207,7 @@ def fetch_themes():
                 installed += 1
 
         display_dest = dest.replace(os.path.expanduser("~"), "~")
+        log.info("fetch themes  installed=%d  dest=%s", installed, display_dest)
         print(f"Installed {installed} themes to {display_dest}")
 
     except OSError as e:
@@ -211,14 +222,18 @@ def load_mappings():
 
 
 def save_mappings(mappings):
+    log.info("save mappings  count=%d  file=%s", len(mappings), MAPPINGS_FILE)
     save_json(MAPPINGS_FILE, mappings)
 
 
 # --- OSC helpers (emit to current terminal) ---
 
-def osc_set_colors(theme):
+def osc_set_colors(theme, reason=None):
     """Emit OSC sequences to apply a full theme to the current terminal."""
-    _osc_write_theme(os.environ.get("TTY") or "/dev/tty", theme)
+    tty_path = os.environ.get("TTY") or "/dev/tty"
+    if reason:
+        log.info("apply theme  bg=%s fg=%s  tty=%s  reason=%s", theme.get("background"), theme.get("foreground"), tty_path, reason)
+    _osc_write_theme(tty_path, theme)
 
 
 def _osc_write_theme(tty_path, theme):
@@ -236,9 +251,11 @@ def _osc_write_theme(tty_path, theme):
         pass
 
 
-def osc_reset():
+def osc_reset(reason=None):
     """Reset terminal colors to Ghostty config defaults."""
     tty = os.environ.get("TTY") or "/dev/tty"
+    if reason:
+        log.info("reset theme  tty=%s  reason=%s", tty, reason)
     try:
         with open(tty, "w") as t:
             t.write("\033]110\033\\")
@@ -250,8 +267,25 @@ def osc_reset():
         pass
 
 
+def _resolve_own_tty():
+    """Get the actual tty device path (e.g. /dev/ttys011), not the generic /dev/tty."""
+    # $TTY is set by zsh to the real device path
+    env_tty = os.environ.get("TTY", "")
+    if env_tty and env_tty != "/dev/tty":
+        return env_tty
+    # Fall back to os.ttyname on stdin/stdout/stderr
+    for fd_num in (0, 1, 2):
+        try:
+            return os.ttyname(fd_num)
+        except (OSError, AttributeError):
+            continue
+    return ""
+
+
 def broadcast_updates(mappings, themes):
     """Try to update colors in other running Ghostty terminals."""
+    # Skip the caller's own tty — it was already set correctly
+    own_tty = _resolve_own_tty()
     try:
         result = subprocess.run(
             ["lsof", "-c", "zsh", "+D", "/dev/", "-Fn"],
@@ -265,6 +299,12 @@ def broadcast_updates(mappings, themes):
         if line.startswith("n/dev/ttys") or line.startswith("n/dev/pts/"):
             ttys.add(line[1:])
 
+    # Don't broadcast back to the terminal that just saved
+    if own_tty and own_tty in ttys:
+        log.info("broadcast  skipping own tty=%s", own_tty)
+        ttys.discard(own_tty)
+
+    log.info("broadcast  found %d ttys", len(ttys))
     updated = 0
     for tty_path in ttys:
         try:
@@ -273,7 +313,10 @@ def broadcast_updates(mappings, themes):
                 capture_output=True, text=True, timeout=2
             )
             pids = lsof_tty.stdout.strip().splitlines()
+            applied = False
             for pid in pids:
+                if applied:
+                    break
                 try:
                     cwd_link = f"/proc/{pid}/cwd"
                     if os.path.exists(cwd_link):
@@ -294,8 +337,10 @@ def broadcast_updates(mappings, themes):
                         if cwd.startswith(m["directory"]):
                             theme = themes.get(m["theme"])
                             if theme:
+                                log.info("broadcast  applying theme=%s to tty=%s (cwd=%s, pid=%s)", m["theme"], tty_path, cwd, pid)
                                 _osc_write_theme(tty_path, theme)
                                 updated += 1
+                                applied = True
                             break
                 except (IOError, OSError, subprocess.TimeoutExpired):
                     continue
@@ -362,6 +407,7 @@ def generate_hook():
 
     with open(HOOK_FILE, "w") as f:
         f.write("\n".join(lines))
+    log.info("hook generated  mappings=%d  file=%s", len(mappings), HOOK_FILE)
 
 
 def batch_fill(root, mappings, theme_names):
@@ -470,13 +516,14 @@ def run_inline():
 
     def restore_or_reset():
         if saved_theme:
-            osc_set_colors(saved_theme)
+            osc_set_colors(saved_theme, reason="inline-picker restore saved theme")
         else:
-            osc_reset()
+            osc_reset(reason="inline-picker restore default")
 
     try:
         tty.setcbreak(fd)
-        osc_set_colors(themes[theme_names[idx]])
+        log.info("inline picker opened  dir=%s  themes=%d", cwd, len(theme_names))
+        osc_set_colors(themes[theme_names[idx]], reason=f"inline-picker preview: {theme_names[idx]}")
         render()
 
         while True:
@@ -495,6 +542,7 @@ def run_inline():
                 else:
                     # Bare Esc — quit without saving
                     restore_or_reset()
+                    log.info("inline picker closed  action=quit-esc")
                     clear_and_print("  gdt quit without saving")
                     return
             elif c == ord("h"):
@@ -503,6 +551,7 @@ def run_inline():
                 idx = (idx + 1) % len(theme_names)
             elif c == ord("q"):
                 restore_or_reset()
+                log.info("inline picker closed  action=quit-q")
                 clear_and_print("  gdt quit without saving")
                 return
             elif c in (10, 13):  # Enter — save
@@ -516,6 +565,8 @@ def run_inline():
                         break
                 if not found:
                     mappings.append({"directory": cwd, "theme": chosen})
+
+                log.info("inline picker saved  dir=%s  theme=%s", cwd, chosen)
 
                 # Save with spinner
                 save_done = threading.Event()
@@ -538,7 +589,100 @@ def run_inline():
             else:
                 continue
 
-            osc_set_colors(themes[theme_names[idx]])
+            osc_set_colors(themes[theme_names[idx]], reason=f"inline-picker preview: {theme_names[idx]}")
+            render()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+# --- Delete picker ---
+
+def run_delete():
+    """Inline picker to delete mappings that apply to the current directory."""
+    mappings = load_mappings()
+    cwd = os.getcwd()
+
+    # Find all matching mappings: exact and parent matches
+    matches = []
+    for i, m in enumerate(mappings):
+        d = m["directory"].rstrip("/")
+        if cwd == m["directory"] or cwd == d:
+            matches.append((i, m, "exact"))
+        elif cwd.startswith(d + "/"):
+            matches.append((i, m, "parent"))
+
+    if not matches:
+        print("No mappings for this directory.")
+        return
+
+    home = os.path.expanduser("~")
+    cursor = 0
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    # Reserve 3 lines
+    sys.stdout.write("\n\n\n")
+    sys.stdout.flush()
+
+    def render():
+        _, m, match_type = matches[cursor]
+        display_dir = m["directory"].replace(home, "~") if m["directory"].startswith(home) else m["directory"]
+        counter = f"({cursor + 1}/{len(matches)})  " if len(matches) > 1 else ""
+        line = f"  {display_dir} \u2192 {m['theme']}  {counter}({match_type})"
+        footer = "  \u2190/\u2192 cycle   Enter delete   q/Esc quit" if len(matches) > 1 else "  Enter delete   q/Esc quit"
+        sys.stdout.write(f"\033[3A\r\033[K\n\033[K{line}\n\033[K{footer}\n")
+        sys.stdout.flush()
+
+    def clear_and_print(msg):
+        sys.stdout.write(f"\033[3A\r\033[K\n\033[K{msg}\n\033[K\n")
+        sys.stdout.flush()
+
+    try:
+        tty.setcbreak(fd)
+        log.info("delete picker opened  dir=%s  matches=%d", cwd, len(matches))
+        render()
+
+        while True:
+            ch = os.read(fd, 1)
+            if not ch:
+                break
+            c = ch[0]
+
+            if c == 0x1b:  # Escape or arrow key
+                if _has_more_input(fd):
+                    seq = os.read(fd, 2)
+                    if seq == b"[D" or seq == b"[h":  # Left
+                        cursor = (cursor - 1) % len(matches)
+                    elif seq == b"[C" or seq == b"[l":  # Right
+                        cursor = (cursor + 1) % len(matches)
+                    else:
+                        continue
+                else:
+                    log.info("delete picker closed  action=quit-esc")
+                    clear_and_print("  gdt quit without deleting")
+                    return
+            elif c == ord("h"):
+                cursor = (cursor - 1) % len(matches)
+            elif c == ord("l"):
+                cursor = (cursor + 1) % len(matches)
+            elif c == ord("q"):
+                log.info("delete picker closed  action=quit-q")
+                clear_and_print("  gdt quit without deleting")
+                return
+            elif c in (10, 13):  # Enter — delete
+                mapping_idx, m, match_type = matches[cursor]
+                display_dir = m["directory"].replace(home, "~") if m["directory"].startswith(home) else m["directory"]
+                log.info("delete  dir=%s  theme=%s  match=%s", m["directory"], m["theme"], match_type)
+                mappings.pop(mapping_idx)
+                save_mappings(mappings)
+                generate_hook()
+                osc_reset(reason="delete picker removed mapping")
+                clear_and_print(f"  Deleted: {display_dir} \u2192 {m['theme']}  ({match_type})")
+                return
+            else:
+                continue
+
             render()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -568,6 +712,7 @@ class TUI:
         curses.use_default_colors()
         self.stdscr.timeout(-1)
         self.stdscr.keypad(True)
+        log.info("TUI opened  mappings=%d  themes=%d", len(self.mappings), len(self.theme_names))
         self.preview_current_mapping()
 
         while True:
@@ -588,8 +733,11 @@ class TUI:
         if self.dirty:
             save_mappings(self.mappings)
             generate_hook()
+            log.info("TUI closed  action=save  mappings=%d", len(self.mappings))
             self.status = "Saved."
-        osc_reset()
+        else:
+            log.info("TUI closed  action=quit  dirty=False")
+        osc_reset(reason="TUI exit")
 
     def draw(self):
         self.stdscr.erase()
@@ -681,7 +829,7 @@ class TUI:
             tname = self.mappings[self.cursor]["theme"]
             theme = self.themes.get(tname)
             if theme:
-                osc_set_colors(theme)
+                osc_set_colors(theme, reason=f"TUI preview: {tname}")
 
     def _page_size(self):
         h, _ = self.stdscr.getmaxyx()
@@ -719,6 +867,7 @@ class TUI:
         self.dirty = False
         self.mode = "main"
         count = self._save_result or 0
+        log.info("TUI save complete  broadcast=%d terminals", count)
         self.status = f"Saved & hook regenerated. Broadcast to {count} terminal(s)."
 
     def handle_main(self, key):
@@ -762,6 +911,7 @@ class TUI:
                 self.cursor = min(self.cursor, max(0, len(self.mappings) - 1))
                 self._ensure_cursor_visible()
                 self.dirty = True
+                log.info("TUI delete mapping  dir=%s  theme=%s", removed["directory"], removed["theme"])
                 self.status = f"Removed: {removed['directory']}"
         elif key in (ord("\n"), curses.KEY_ENTER, 10, 13, ord("e")):
             if self.mappings:
@@ -783,7 +933,7 @@ class TUI:
     def preview_carousel_theme(self):
         tname = self.theme_names[self.carousel_idx]
         theme = self.themes[tname]
-        osc_set_colors(theme)
+        osc_set_colors(theme, reason=f"TUI carousel preview: {tname}")
         self.status = f"Preview: {tname}  ({self.carousel_idx + 1}/{len(self.theme_names)})"
 
     def handle_carousel(self, key):
@@ -795,14 +945,16 @@ class TUI:
             self.preview_carousel_theme()
         elif key in (ord("\n"), curses.KEY_ENTER, 10, 13):
             tname = self.theme_names[self.carousel_idx]
+            dir_path = self.mappings[self.cursor]["directory"]
             self.mappings[self.cursor]["theme"] = tname
             self.dirty = True
             self.mode = "main"
+            log.info("TUI carousel set  dir=%s  theme=%s", dir_path, tname)
             self.preview_current_mapping()
             self.status = f"Set theme: {tname}"
         elif key == 27:  # Esc
             self.mode = "main"
-            osc_reset()
+            osc_reset(reason="TUI carousel cancel")
             self.status = "Cancelled."
 
     def handle_add_dir(self, key):
@@ -911,6 +1063,7 @@ def main():
     parser.add_argument("--generate-hook", action="store_true", help="Regenerate hook.zsh and exit")
     parser.add_argument("--fetch-themes", action="store_true", help="Download ~460 Ghostty themes from GitHub")
     parser.add_argument("--refresh", action="store_true", help="Reapply the theme for the current directory")
+    parser.add_argument("--delete", action="store_true", help="Delete a mapping for the current directory")
     parser.add_argument("--all", action="store_true", help="Open full-screen TUI to manage all mappings")
     parser.add_argument("--version", action="store_true", help="Print version and exit")
     args = parser.parse_args()
@@ -933,14 +1086,18 @@ def main():
                 themes = discover_themes()
                 theme = themes.get(m["theme"])
                 if theme:
-                    osc_set_colors(theme)
+                    osc_set_colors(theme, reason=f"refresh: {m['theme']} for {cwd}")
                     return
-        osc_reset()
+        osc_reset(reason=f"refresh: no mapping for {cwd}")
         return
 
     if args.generate_hook:
         generate_hook()
         print(f"Generated: {HOOK_FILE}")
+        return
+
+    if args.delete:
+        run_delete()
         return
 
     # Ensure mappings file exists
