@@ -10,13 +10,19 @@ import sys
 import subprocess
 import glob
 import random
+import shutil
 import termios
 import threading
 import tty
 
-CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
+VERSION = "0.1.0"
+
+CONFIG_DIR = os.environ.get("GDT_CONFIG_DIR") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "gdt"
+)
 MAPPINGS_FILE = os.path.join(CONFIG_DIR, "mappings.json")
 HOOK_FILE = os.path.join(CONFIG_DIR, "hook.zsh")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 if sys.platform == "darwin":
     GHOSTTY_BUILTIN_THEMES = "/Applications/Ghostty.app/Contents/Resources/ghostty/themes"
@@ -25,6 +31,16 @@ elif sys.platform.startswith("linux"):
 else:
     GHOSTTY_BUILTIN_THEMES = ""
 GHOSTTY_USER_THEMES = os.path.expanduser("~/.config/ghostty/themes")
+
+
+def maybe_migrate():
+    """Migrate mappings.json from old script-dir location to XDG config dir."""
+    old_mappings = os.path.join(SCRIPT_DIR, "mappings.json")
+    if os.path.exists(old_mappings) and not os.path.exists(MAPPINGS_FILE):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        shutil.copy2(old_mappings, MAPPINGS_FILE)
+        print(f"Migrated mappings.json to {MAPPINGS_FILE}")
+        print(f"Update your .zshrc to: source {HOOK_FILE}")
 
 
 def load_json(path, default=None):
@@ -795,8 +811,30 @@ class TUI:
 def main():
     parser = argparse.ArgumentParser(description="Manage per-directory Ghostty color themes")
     parser.add_argument("--generate-hook", action="store_true", help="Regenerate hook.zsh and exit")
+    parser.add_argument("--refresh", action="store_true", help="Reapply the theme for the current directory")
     parser.add_argument("--all", action="store_true", help="Open full-screen TUI to manage all mappings")
+    parser.add_argument("--version", action="store_true", help="Print version and exit")
     args = parser.parse_args()
+
+    if args.version:
+        print(f"gdt {VERSION}")
+        return
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    maybe_migrate()
+
+    if args.refresh:
+        mappings = load_mappings()
+        cwd = os.getcwd()
+        for m in mappings:
+            if cwd == m["directory"] or cwd.startswith(m["directory"].rstrip("/") + "/"):
+                themes = discover_themes()
+                theme = themes.get(m["theme"])
+                if theme:
+                    osc_set_colors(theme)
+                    return
+        osc_reset()
+        return
 
     if args.generate_hook:
         generate_hook()

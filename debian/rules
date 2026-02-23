@@ -1,0 +1,9 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_build:
+	# Nothing to build — single-file Python script
+
+override_dh_auto_install:
+	install -D -m 755 gdt $(CURDIR)/debian/gdt/usr/bin/gdt
