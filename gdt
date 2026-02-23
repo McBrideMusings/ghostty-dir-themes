@@ -11,8 +11,12 @@ import subprocess
 import glob
 import random
 import termios
+import tarfile
+import tempfile
 import threading
 import tty
+import urllib.error
+import urllib.request
 
 CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
 MAPPINGS_FILE = os.path.join(CONFIG_DIR, "mappings.json")
@@ -25,6 +29,7 @@ elif sys.platform.startswith("linux"):
 else:
     GHOSTTY_BUILTIN_THEMES = ""
 GHOSTTY_USER_THEMES = os.path.expanduser("~/.config/ghostty/themes")
+THEMES_TARBALL_URL = "https://github.com/mbadolato/iTerm2-Color-Schemes/archive/refs/heads/master.tar.gz"
 
 
 def load_json(path, default=None):
@@ -93,6 +98,96 @@ def discover_themes():
             if theme:
                 themes[entry] = theme
     return themes
+
+
+def _cleanup_tmp(path):
+    """Remove a temporary file, ignoring errors."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def fetch_themes():
+    """Download Ghostty themes from GitHub and install to user themes directory."""
+    dest = GHOSTTY_USER_THEMES
+    os.makedirs(dest, exist_ok=True)
+
+    tmp_path = None
+    try:
+        # Download tarball to a temp file
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".tar.gz")
+        os.close(tmp_fd)
+
+        print(f"Downloading themes from GitHub...")
+        try:
+            req = urllib.request.Request(THEMES_TARBALL_URL)
+            resp = urllib.request.urlopen(req, timeout=30)
+        except urllib.error.URLError as e:
+            print(f"Error: could not download themes: {e}")
+            return
+        except OSError as e:
+            print(f"Error: network failure: {e}")
+            return
+
+        total = resp.headers.get("Content-Length")
+        total = int(total) if total else None
+
+        downloaded = 0
+        with open(tmp_path, "wb") as f:
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total:
+                    pct = downloaded * 100 // total
+                    bar_len = 30
+                    filled = bar_len * downloaded // total
+                    bar = "█" * filled + "░" * (bar_len - filled)
+                    sys.stdout.write(f"\r  [{bar}] {pct}% ({downloaded // 1024}/{total // 1024} KB)")
+                else:
+                    sys.stdout.write(f"\r  Downloaded {downloaded // 1024} KB...")
+                sys.stdout.flush()
+        print()
+
+        # Extract ghostty/ theme files from tarball
+        try:
+            tf = tarfile.open(tmp_path, "r:gz")
+        except (tarfile.TarError, OSError) as e:
+            print(f"Error: corrupt or unreadable tarball: {e}")
+            return
+
+        installed = 0
+        with tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                # Files are under <repo-name>/ghostty/<theme-name>
+                parts = member.name.split("/")
+                if len(parts) < 3 or parts[1] != "ghostty":
+                    continue
+                theme_name = parts[-1]
+                # Sanitize: reject path traversal attempts
+                if "/" in theme_name or theme_name.startswith("."):
+                    continue
+                out_path = os.path.join(dest, theme_name)
+                fobj = tf.extractfile(member)
+                if fobj is None:
+                    continue
+                with open(out_path, "wb") as out:
+                    out.write(fobj.read())
+                installed += 1
+
+        display_dest = dest.replace(os.path.expanduser("~"), "~")
+        print(f"Installed {installed} themes to {display_dest}")
+
+    except OSError as e:
+        print(f"Error: {e}")
+    finally:
+        if tmp_path:
+            _cleanup_tmp(tmp_path)
 
 
 def load_mappings():
@@ -658,6 +753,9 @@ class TUI:
         return True
 
     def enter_carousel(self):
+        if not self.theme_names:
+            self.status = "No themes available. Run 'gdt --fetch-themes' to download themes."
+            return
         self.mode = "carousel"
         current_theme = self.mappings[self.cursor]["theme"]
         if current_theme in self.theme_names:
@@ -795,8 +893,13 @@ class TUI:
 def main():
     parser = argparse.ArgumentParser(description="Manage per-directory Ghostty color themes")
     parser.add_argument("--generate-hook", action="store_true", help="Regenerate hook.zsh and exit")
+    parser.add_argument("--fetch-themes", action="store_true", help="Download ~460 Ghostty themes from GitHub")
     parser.add_argument("--all", action="store_true", help="Open full-screen TUI to manage all mappings")
     args = parser.parse_args()
+
+    if args.fetch_themes:
+        fetch_themes()
+        return
 
     if args.generate_hook:
         generate_hook()
@@ -806,6 +909,10 @@ def main():
     # Ensure mappings file exists
     if not os.path.exists(MAPPINGS_FILE):
         save_mappings([])
+
+    # Auto-fetch if no themes available
+    if not discover_themes():
+        fetch_themes()
 
     if args.all:
         def run_tui(stdscr):
