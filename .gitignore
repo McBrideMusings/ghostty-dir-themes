@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+mappings.json
+hook.zsh
