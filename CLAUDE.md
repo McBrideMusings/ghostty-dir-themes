@@ -33,6 +33,9 @@ Flow: user edits mappings in TUI → on save, `hook.zsh` is regenerated with a `
 
 # Print version
 ./gdt --version
+
+# Check for broken directory mappings (stale paths)
+./gdt --doctor
 ```
 
 No dependencies beyond Python 3 stdlib. No build step, no tests, no linting configured.

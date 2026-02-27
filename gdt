@@ -688,6 +688,37 @@ def run_delete():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
+# --- Doctor ---
+
+def run_doctor():
+    """Check for broken directory mappings and offer to remove them."""
+    mappings = load_mappings()
+    stale = [(i, m) for i, m in enumerate(mappings) if not os.path.isdir(m["directory"])]
+
+    if not stale:
+        print("All mappings are healthy.")
+        return
+
+    print(f"Found {len(stale)} broken mapping(s):\n")
+    for _, m in stale:
+        display = m["directory"].replace(os.path.expanduser("~"), "~")
+        print(f"  {display} -> {m['theme']}")
+
+    print()
+    answer = input("Remove broken mappings? [y/N] ").strip().lower()
+    if answer != "y":
+        print("No changes made.")
+        return
+
+    # Remove in reverse order to preserve indices
+    for i, _ in reversed(stale):
+        mappings.pop(i)
+
+    save_mappings(mappings)
+    generate_hook()
+    print(f"Removed {len(stale)} mapping(s) and regenerated hook.")
+
+
 # --- Curses TUI ---
 
 class TUI:
@@ -1064,6 +1095,7 @@ def main():
     parser.add_argument("--fetch-themes", action="store_true", help="Download ~460 Ghostty themes from GitHub")
     parser.add_argument("--refresh", action="store_true", help="Reapply the theme for the current directory")
     parser.add_argument("--delete", action="store_true", help="Delete a mapping for the current directory")
+    parser.add_argument("--doctor", action="store_true", help="Find and fix broken directory mappings")
     parser.add_argument("--all", action="store_true", help="Open full-screen TUI to manage all mappings")
     parser.add_argument("--version", action="store_true", help="Print version and exit")
     args = parser.parse_args()
@@ -1098,6 +1130,10 @@ def main():
 
     if args.delete:
         run_delete()
+        return
+
+    if args.doctor:
+        run_doctor()
         return
 
     # Ensure mappings file exists

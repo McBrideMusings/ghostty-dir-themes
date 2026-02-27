@@ -71,6 +71,18 @@ gdt --all
 | `s` | Save mappings and regenerate the hook |
 | `q` | Quit (auto-saves if there are changes) |
 
+### Delete a Mapping
+
+Run `gdt --delete` to remove a mapping for the current directory.
+
+### Doctor
+
+Check for broken directory mappings (directories that no longer exist) and clean them up:
+
+```bash
+gdt --doctor
+```
+
 ### Regenerate Hook
 
 ```bash
