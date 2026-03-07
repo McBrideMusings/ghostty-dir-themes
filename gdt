@@ -886,8 +886,11 @@ class TUI:
             generate_hook()
             zsh_tty_pids = _discover_zsh_ttys()
             count = 0
+            old = {m["directory"]: m["theme"] for m in json.loads(self.original_mappings)}
             for m in self.mappings:
-                count += broadcast_updates(m["directory"], m["theme"], self.themes, zsh_tty_pids)
+                old_theme = old.get(m["directory"])
+                if old_theme != m["theme"]:
+                    count += broadcast_updates(m["directory"], m["theme"], self.themes, zsh_tty_pids)
             self._save_result = count
 
         thread = threading.Thread(target=_worker, daemon=True)
@@ -901,6 +904,7 @@ class TUI:
         self.stdscr.timeout(-1)
 
         self.dirty = False
+        self.original_mappings = json.dumps(self.mappings)
         self.mode = "main"
         count = self._save_result or 0
         log.info("TUI save complete  broadcast=%d terminals", count)
