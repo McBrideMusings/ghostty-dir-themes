@@ -282,68 +282,70 @@ def _resolve_own_tty():
     return ""
 
 
-def broadcast_updates(mappings, themes):
-    """Try to update colors in other running Ghostty terminals."""
-    # Skip the caller's own tty — it was already set correctly
-    own_tty = _resolve_own_tty()
+def _discover_zsh_ttys():
+    """Return dict of tty_path → zsh_pid for all running zsh sessions."""
     try:
         result = subprocess.run(
             ["lsof", "-c", "zsh", "+D", "/dev/", "-Fn"],
             capture_output=True, text=True, timeout=3
         )
     except Exception:
+        return {}
+
+    zsh_tty_pids = {}
+    current_pid = None
+    for line in result.stdout.splitlines():
+        if line.startswith("p"):
+            current_pid = line[1:]
+        elif (line.startswith("n/dev/ttys") or line.startswith("n/dev/pts/")) and current_pid:
+            tty = line[1:]
+            if tty not in zsh_tty_pids:
+                zsh_tty_pids[tty] = current_pid
+
+    own_tty = _resolve_own_tty()
+    if own_tty and own_tty in zsh_tty_pids:
+        log.info("broadcast  skipping own tty=%s", own_tty)
+        del zsh_tty_pids[own_tty]
+
+    return zsh_tty_pids
+
+
+def _resolve_tty_cwd(pid):
+    """Get the cwd of a process by PID."""
+    cwd_link = f"/proc/{pid}/cwd"
+    if os.path.exists(cwd_link):
+        return os.readlink(cwd_link)
+    lsof_cwd = subprocess.run(
+        ["lsof", "-a", "-p", pid, "-Fn", "-d", "cwd"],
+        capture_output=True, text=True, timeout=2
+    )
+    for l in lsof_cwd.stdout.splitlines():
+        if l.startswith("n/"):
+            return l[1:]
+    return None
+
+
+def broadcast_updates(directory, theme_name, themes, zsh_tty_pids=None):
+    """Push a theme update to other terminals sitting in the given directory."""
+    theme = themes.get(theme_name)
+    if not theme:
         return 0
 
-    ttys = set()
-    for line in result.stdout.splitlines():
-        if line.startswith("n/dev/ttys") or line.startswith("n/dev/pts/"):
-            ttys.add(line[1:])
+    if zsh_tty_pids is None:
+        zsh_tty_pids = _discover_zsh_ttys()
 
-    # Don't broadcast back to the terminal that just saved
-    if own_tty and own_tty in ttys:
-        log.info("broadcast  skipping own tty=%s", own_tty)
-        ttys.discard(own_tty)
-
-    log.info("broadcast  found %d ttys", len(ttys))
+    directory = directory.rstrip("/")
+    log.info("broadcast  found %d ttys  target_dir=%s  theme=%s", len(zsh_tty_pids), directory, theme_name)
     updated = 0
-    for tty_path in ttys:
+    for tty_path, pid in zsh_tty_pids.items():
         try:
-            lsof_tty = subprocess.run(
-                ["lsof", "-t", tty_path],
-                capture_output=True, text=True, timeout=2
-            )
-            pids = lsof_tty.stdout.strip().splitlines()
-            applied = False
-            for pid in pids:
-                if applied:
-                    break
-                try:
-                    cwd_link = f"/proc/{pid}/cwd"
-                    if os.path.exists(cwd_link):
-                        cwd = os.readlink(cwd_link)
-                    else:
-                        lsof_cwd = subprocess.run(
-                            ["lsof", "-p", pid, "-Fn", "-d", "cwd"],
-                            capture_output=True, text=True, timeout=2
-                        )
-                        cwd = None
-                        for l in lsof_cwd.stdout.splitlines():
-                            if l.startswith("n/"):
-                                cwd = l[1:]
-                        if not cwd:
-                            continue
-
-                    for m in mappings:
-                        if cwd.startswith(m["directory"]):
-                            theme = themes.get(m["theme"])
-                            if theme:
-                                log.info("broadcast  applying theme=%s to tty=%s (cwd=%s, pid=%s)", m["theme"], tty_path, cwd, pid)
-                                _osc_write_theme(tty_path, theme)
-                                updated += 1
-                                applied = True
-                            break
-                except (IOError, OSError, subprocess.TimeoutExpired):
-                    continue
+            cwd = _resolve_tty_cwd(pid)
+            if not cwd:
+                continue
+            if cwd == directory or cwd.startswith(directory + "/"):
+                log.info("broadcast  applying theme=%s to tty=%s (cwd=%s, pid=%s)", theme_name, tty_path, cwd, pid)
+                _osc_write_theme(tty_path, theme)
+                updated += 1
         except (IOError, OSError, subprocess.TimeoutExpired):
             continue
     return updated
@@ -381,7 +383,7 @@ def generate_hook():
         '  case "$PWD" in',
     ]
 
-    for m in mappings:
+    for m in sorted(mappings, key=lambda m: len(m["directory"]), reverse=True):
         theme = themes.get(m["theme"])
         if theme:
             d = m["directory"].rstrip("/")
@@ -472,7 +474,7 @@ def run_inline():
 
     # Find existing mapping for current directory
     idx = 0
-    for m in mappings:
+    for m in sorted(mappings, key=lambda m: len(m["directory"]), reverse=True):
         if cwd == m["directory"] or cwd.startswith(m["directory"].rstrip("/") + "/"):
             if m["theme"] in theme_names:
                 idx = theme_names.index(m["theme"])
@@ -509,7 +511,7 @@ def run_inline():
 
     # Find the existing saved theme for this directory (to restore on quit)
     saved_theme = None
-    for m in mappings:
+    for m in sorted(mappings, key=lambda m: len(m["directory"]), reverse=True):
         if cwd == m["directory"] or cwd.startswith(m["directory"].rstrip("/") + "/"):
             saved_theme = themes.get(m["theme"])
             break
@@ -573,7 +575,7 @@ def run_inline():
                 def _save_worker():
                     save_mappings(mappings)
                     generate_hook()
-                    broadcast_updates(mappings, themes)
+                    broadcast_updates(cwd, chosen, themes)
                     save_done.set()
 
                 thread = threading.Thread(target=_save_worker, daemon=True)
@@ -882,7 +884,10 @@ class TUI:
         def _worker():
             save_mappings(self.mappings)
             generate_hook()
-            count = broadcast_updates(self.mappings, self.themes)
+            zsh_tty_pids = _discover_zsh_ttys()
+            count = 0
+            for m in self.mappings:
+                count += broadcast_updates(m["directory"], m["theme"], self.themes, zsh_tty_pids)
             self._save_result = count
 
         thread = threading.Thread(target=_worker, daemon=True)
@@ -1113,7 +1118,7 @@ def main():
     if args.refresh:
         mappings = load_mappings()
         cwd = os.getcwd()
-        for m in mappings:
+        for m in sorted(mappings, key=lambda m: len(m["directory"]), reverse=True):
             if cwd == m["directory"] or cwd.startswith(m["directory"].rstrip("/") + "/"):
                 themes = discover_themes()
                 theme = themes.get(m["theme"])
