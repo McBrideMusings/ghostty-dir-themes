@@ -46,6 +46,7 @@ No dependencies beyond Python 3 stdlib. No build step, no tests, no linting conf
 - OSC sequences target `/dev/tty` (or `$TTY`) to change bg (OSC 11), fg (OSC 10), and cursor color (OSC 12)
 - The "broadcast" feature (`broadcast_updates`) uses `lsof` to find other zsh ttys and push color updates to them
 - `hook.zsh` is a pure shell script with no runtime dependency on Python — it's fully self-contained after generation
+- The hook self-updates on `chpwd`: it records its mtime at source time and re-`source`s itself when the file on disk changes, so already-running shells pick up new mappings without manual reload
 
 ## Distribution
 
