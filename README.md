@@ -51,6 +51,7 @@ gdt
 | Key | Action |
 |-----|--------|
 | `Left` / `Right` (or `h` / `l`) | Cycle through themes (live preview) |
+| `r` | Jump to a random theme (never the current one) |
 | `Enter` | Save mapping and keep theme |
 | `q` / `Esc` | Quit without saving (restores previous theme) |
 
@@ -67,6 +68,7 @@ gdt --all
 | `a` | Add a directory mapping |
 | `b` | Batch-fill all subdirectories of a root |
 | `d` | Delete the selected mapping |
+| `r` | Relax: reassign every mapping so themes are spread maximally apart in color space |
 | `Enter` | Edit theme for selected mapping (carousel) |
 | `s` | Save mappings and regenerate the hook |
 | `q` | Quit (auto-saves if there are changes) |

@@ -110,6 +110,99 @@ def parse_theme_file(path):
     return theme
 
 
+def _hex_to_rgb(value):
+    """Parse a Ghostty color value (#rrggbb, rrggbb, or #rgb) into an (r,g,b) tuple."""
+    if not value:
+        return None
+    v = value.strip().lstrip("#")
+    if len(v) == 3:
+        v = "".join(c * 2 for c in v)
+    if len(v) != 6:
+        return None
+    try:
+        return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
+    except ValueError:
+        return None
+
+
+def _rgb_to_lab(rgb):
+    """Convert an sRGB (0-255) tuple to CIE L*a*b* for perceptual distance."""
+    def _lin(c):
+        c = c / 255.0
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (_lin(x) for x in rgb)
+    x = (r * 0.4124 + g * 0.3576 + b * 0.1805) / 0.95047
+    y = (r * 0.2126 + g * 0.7152 + b * 0.0722) / 1.0
+    z = (r * 0.0193 + g * 0.1192 + b * 0.9505) / 1.08883
+
+    def _f(t):
+        return t ** (1.0 / 3.0) if t > 0.008856 else (7.787 * t + 16.0 / 116.0)
+    fx, fy, fz = _f(x), _f(y), _f(z)
+    return (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+
+
+def _theme_color_vector(theme):
+    """Lab vector over [background, foreground, palette 0..15].
+
+    Missing palette entries fall back to the background color so themes
+    without a full palette still compare sensibly.
+    """
+    bg = _hex_to_rgb(theme.get("background")) or (0, 0, 0)
+    fg = _hex_to_rgb(theme.get("foreground")) or (255, 255, 255)
+    palette = theme.get("palette", {})
+    colors = [bg, fg]
+    for i in range(16):
+        colors.append(_hex_to_rgb(palette.get(i)) or bg)
+    return [_rgb_to_lab(c) for c in colors]
+
+
+def _vector_distance_sq(va, vb):
+    """Squared Euclidean distance between two Lab color vectors."""
+    s = 0.0
+    for (la, aa, ba), (lb, ab, bb) in zip(va, vb):
+        dl = la - lb
+        da = aa - ab
+        db = ba - bb
+        s += dl * dl + da * da + db * db
+    return s
+
+
+def relax_assign(theme_names, themes, count):
+    """Pick `count` themes spread maximally apart in color space.
+
+    Uses farthest-point sampling (greedy max-min over the full 16-color
+    palette + bg/fg in Lab space). Deterministic. When count <= number of
+    available themes, every returned name is unique; beyond that the spread
+    ordering is cycled and repeats are unavoidable.
+    """
+    names = list(theme_names)
+    if not names or count <= 0:
+        return []
+    vecs = {n: _theme_color_vector(themes[n]) for n in names}
+    M = len(names)
+    L = len(next(iter(vecs.values())))
+    # Per-slot centroid across all themes, used to seed deterministically.
+    centroid = []
+    for j in range(L):
+        cl = sum(vecs[n][j][0] for n in names) / M
+        ca = sum(vecs[n][j][1] for n in names) / M
+        cb = sum(vecs[n][j][2] for n in names) / M
+        centroid.append((cl, ca, cb))
+    # Seed with the theme farthest from the centroid; name breaks ties.
+    ordering = [max(names, key=lambda n: (_vector_distance_sq(vecs[n], centroid), n))]
+    remaining = set(names) - set(ordering)
+    mind = {n: _vector_distance_sq(vecs[n], vecs[ordering[0]]) for n in remaining}
+    while remaining:
+        nxt = max(remaining, key=lambda n: (mind[n], n))
+        ordering.append(nxt)
+        remaining.discard(nxt)
+        for n in remaining:
+            d = _vector_distance_sq(vecs[n], vecs[nxt])
+            if d < mind[n]:
+                mind[n] = d
+    return [ordering[i % len(ordering)] for i in range(count)]
+
+
 def discover_themes():
     """Scan Ghostty built-in and user theme directories."""
     themes = {}
@@ -519,7 +612,7 @@ def run_inline():
         name = theme_names[idx]
         counter = f"({idx + 1}/{len(theme_names)})"
         line = f"  \u25c0  {name}  {counter}  \u25b6"
-        footer = "  \u2190/\u2192 cycle   Enter save   q/Esc quit"
+        footer = "  \u2190/\u2192 cycle   r random   Enter save   q/Esc quit"
         sys.stdout.write(f"\033[3A\r\033[K\n\033[K{line}\n\033[K{footer}\n")
         sys.stdout.flush()
 
@@ -575,6 +668,11 @@ def run_inline():
                 idx = (idx - 1) % len(theme_names)
             elif c == ord("l"):
                 idx = (idx + 1) % len(theme_names)
+            elif c == ord("r"):
+                if len(theme_names) > 1:
+                    idx = random.choice([i for i in range(len(theme_names)) if i != idx])
+                else:
+                    idx = 0
             elif c == ord("q"):
                 restore_or_reset()
                 log.info("inline picker closed  action=quit-q")
@@ -866,9 +964,9 @@ class TUI:
         elif self.mode == "main":
             total_pages = (max(len(self.mappings), 1) + page_size - 1) // page_size
             if total_pages > 1:
-                foot = " ↑↓ Navigate  ←→ Page  a Add  b Batch  d Delete  Enter Edit theme  s Save  q Quit "
+                foot = " ↑↓ Navigate  ←→ Page  a Add  b Batch  d Delete  r Relax  Enter Edit theme  s Save  q Quit "
             else:
-                foot = " ↑↓ Navigate  a Add  b Batch  d Delete  Enter Edit theme  s Save  q Quit "
+                foot = " ↑↓ Navigate  a Add  b Batch  d Delete  r Relax  Enter Edit theme  s Save  q Quit "
             self.stdscr.addstr(footer_y, 0, foot[:w-1], curses.A_REVERSE)
         elif self.mode in ("add_dir", "batch_dir"):
             label = "Directory path" if self.mode == "add_dir" else "Batch root"
@@ -934,11 +1032,45 @@ class TUI:
         log.info("TUI save complete  broadcast=%d terminals", count)
         self.status = f"Saved & hook regenerated. Broadcast to {count} terminal(s)."
 
+    def do_relax(self):
+        """Reassign every mapping so the themes in use are spread maximally
+        apart in color space (farthest-point over the full palette)."""
+        if not self.mappings:
+            self.status = "No mappings to relax."
+            return
+        if not self.theme_names:
+            self.status = "No themes available to relax."
+            return
+        count = len(self.mappings)
+        selected = relax_assign(self.theme_names, self.themes, count)
+        if not selected:
+            self.status = "Relax produced no assignment."
+            return
+        changed = 0
+        for m, name in zip(self.mappings, selected):
+            if m["theme"] != name:
+                m["theme"] = name
+                changed += 1
+        if changed:
+            self.dirty = True
+        self.preview_current_mapping()
+        m_count = len(self.theme_names)
+        log.info("TUI relax  dirs=%d  themes=%d  changed=%d", count, m_count, changed)
+        if count > m_count:
+            self.status = (
+                f"Relaxed {count} dirs over {m_count} themes — "
+                f"{count - m_count} repeat(s) unavoidable. {changed} changed."
+            )
+        else:
+            self.status = f"Relaxed: {count} themes spread across color space. {changed} changed."
+
     def handle_main(self, key):
         if key == ord("q"):
             return False
         elif key == ord("s"):
             self.do_save_async()
+        elif key == ord("r"):
+            self.do_relax()
         elif key == curses.KEY_UP:
             if self.mappings:
                 self.cursor = max(0, self.cursor - 1)
