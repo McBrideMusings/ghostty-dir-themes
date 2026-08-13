@@ -3,3 +3,4 @@ __pycache__/
 mappings.json
 hook.zsh
 *.local.*
+.claude/skills/verify/
